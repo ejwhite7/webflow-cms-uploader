@@ -4,30 +4,69 @@ import { NextRequest } from 'next/server'
 const SESSION_COOKIE_NAME = 'webflow-blog-session'
 const SESSION_MAX_AGE = 60 * 60 * 24 // 24 hours in seconds
 
-// Simple session token generation (for production, use a proper library like jose)
-function generateSessionToken(): string {
-  const array = new Uint8Array(32)
-  crypto.getRandomValues(array)
-  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('')
+// Get secret key from env or generate a stable one
+function getSecretKey(): string {
+  // Use AUTH_PASSWORD as part of the secret for signing
+  // This ensures tokens are invalidated if the password changes
+  const secret = process.env.AUTH_PASSWORD || 'default-secret-key'
+  return secret + '-webflow-blog-session-key'
 }
 
-// In-memory session store (for production, use Redis or database)
-const sessions = new Map<string, { username: string; expires: number }>()
+// Simple token generation with signature
+async function createToken(username: string): Promise<string> {
+  const expires = Date.now() + SESSION_MAX_AGE * 1000
+  const payload = JSON.stringify({ username, expires })
+  const signature = await sign(payload)
+  // Base64 encode payload and signature
+  const token = btoa(payload) + '.' + signature
+  return token
+}
 
-// Clean up expired sessions periodically
-function cleanExpiredSessions() {
-  const now = Date.now()
-  const entries = Array.from(sessions.entries())
-  for (const [token, session] of entries) {
-    if (session.expires < now) {
-      sessions.delete(token)
+// Verify and decode token
+async function verifyToken(token: string): Promise<{ username: string; expires: number } | null> {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 2) return null
+    
+    const payload = atob(parts[0])
+    const signature = parts[1]
+    
+    // Verify signature
+    const expectedSignature = await sign(payload)
+    if (signature !== expectedSignature) {
+      return null
     }
+    
+    const data = JSON.parse(payload)
+    
+    // Check expiry
+    if (data.expires < Date.now()) {
+      return null
+    }
+    
+    return data
+  } catch {
+    return null
   }
 }
 
-// Run cleanup every 5 minutes
-if (typeof setInterval !== 'undefined') {
-  setInterval(cleanExpiredSessions, 5 * 60 * 1000)
+// Create HMAC signature
+async function sign(data: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const keyData = encoder.encode(getSecretKey())
+  const messageData = encoder.encode(data)
+  
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  
+  const signature = await crypto.subtle.sign('HMAC', key, messageData)
+  const signatureArray = new Uint8Array(signature)
+  return Array.from(signatureArray, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export async function validateCredentials(username: string, password: string): Promise<boolean> {
@@ -39,52 +78,12 @@ export async function validateCredentials(username: string, password: string): P
     return false
   }
 
-  // Constant-time comparison to prevent timing attacks
-  const usernameMatch = username.length === validUsername.length && 
-    crypto.subtle ? await timingSafeEqual(username, validUsername) : username === validUsername
-  const passwordMatch = password.length === validPassword.length && 
-    crypto.subtle ? await timingSafeEqual(password, validPassword) : password === validPassword
-
-  return usernameMatch && passwordMatch
-}
-
-// Timing-safe string comparison
-async function timingSafeEqual(a: string, b: string): Promise<boolean> {
-  const encoder = new TextEncoder()
-  const aBytes = encoder.encode(a)
-  const bBytes = encoder.encode(b)
-  
-  if (aBytes.length !== bBytes.length) {
-    return false
-  }
-  
-  // Use subtle crypto for constant-time comparison
-  const aKey = await crypto.subtle.importKey('raw', aBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  const bKey = await crypto.subtle.importKey('raw', bBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  
-  const aSign = await crypto.subtle.sign('HMAC', aKey, new Uint8Array([1]))
-  const bSign = await crypto.subtle.sign('HMAC', bKey, new Uint8Array([1]))
-  
-  const aArr = new Uint8Array(aSign)
-  const bArr = new Uint8Array(bSign)
-  
-  let result = 0
-  for (let i = 0; i < aArr.length; i++) {
-    result |= aArr[i] ^ bArr[i]
-  }
-  
-  return result === 0
+  // Simple comparison (the timing-safe comparison was causing issues)
+  return username === validUsername && password === validPassword
 }
 
 export async function createSession(username: string): Promise<string> {
-  cleanExpiredSessions()
-  
-  const token = generateSessionToken()
-  const expires = Date.now() + SESSION_MAX_AGE * 1000
-  
-  sessions.set(token, { username, expires })
-  
-  return token
+  return await createToken(username)
 }
 
 export async function setSessionCookie(token: string): Promise<void> {
@@ -106,45 +105,22 @@ export async function getSession(): Promise<{ username: string } | null> {
     return null
   }
   
-  const session = sessions.get(token)
-  
-  if (!session || session.expires < Date.now()) {
-    if (session) {
-      sessions.delete(token)
-    }
-    return null
-  }
-  
-  return { username: session.username }
+  const session = await verifyToken(token)
+  return session ? { username: session.username } : null
 }
 
 export async function destroySession(): Promise<void> {
   const cookieStore = await cookies()
-  const token = cookieStore.get(SESSION_COOKIE_NAME)?.value
-  
-  if (token) {
-    sessions.delete(token)
-  }
-  
   cookieStore.delete(SESSION_COOKIE_NAME)
 }
 
-export function getSessionFromRequest(request: NextRequest): { username: string } | null {
+export async function getSessionFromRequest(request: NextRequest): Promise<{ username: string } | null> {
   const token = request.cookies.get(SESSION_COOKIE_NAME)?.value
   
   if (!token) {
     return null
   }
   
-  const session = sessions.get(token)
-  
-  if (!session || session.expires < Date.now()) {
-    if (session) {
-      sessions.delete(token)
-    }
-    return null
-  }
-  
-  return { username: session.username }
+  const session = await verifyToken(token)
+  return session ? { username: session.username } : null
 }
-
