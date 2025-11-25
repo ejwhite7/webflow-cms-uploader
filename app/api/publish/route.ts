@@ -43,13 +43,21 @@ function generateSlug(title: string): string {
 }
 
 // Sanitize HTML for Webflow RichText field
-// Webflow RichText has limited support but tables CAN render on the live site with custom CSS
-// We keep tables intact and only clean up elements that definitely won't work
+// Webflow RichText has limited support - we add inline styles for tables to ensure they render
 function sanitizeHtmlForWebflow(html: string): string {
   let sanitized = html
 
-  // Keep tables intact - they may appear broken in Webflow Designer but render on live site
-  // User needs to add custom CSS to their Webflow site for proper table styling
+  // Add inline styles to tables for Webflow compatibility
+  // This ensures tables render correctly without requiring external CSS
+  const tableStyle = 'width:100%;border-collapse:collapse;margin:1.5rem 0;'
+  const thStyle = 'padding:0.75rem 1rem;border:1px solid #e5e5e5;text-align:left;background-color:#f5f5f5;font-weight:600;'
+  const tdStyle = 'padding:0.75rem 1rem;border:1px solid #e5e5e5;text-align:left;'
+
+  // Add inline styles - use word boundary to avoid matching thead/tbody
+  sanitized = sanitized
+    .replace(/<table\b(?![^>]*style=)([^>]*)>/gi, `<table style="${tableStyle}"$1>`)
+    .replace(/<th\b(?![^>]*style=)([^>]*)>/gi, `<th style="${thStyle}"$1>`)
+    .replace(/<td\b(?![^>]*style=)([^>]*)>/gi, `<td style="${tdStyle}"$1>`)
   
   // Convert code blocks to blockquotes (code blocks aren't supported)
   sanitized = sanitized
